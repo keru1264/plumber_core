@@ -10,6 +10,6 @@ plumber_asset_core = { version = "0.1.0", path = "../plumber_asset_core" }
 plumber_fs = { version = "0.1.0", path = "../plumber_fs" }
 image = { version = "0.24.6", default-features = false }
 thiserror = "1.0.24"
-vtflib2 = { git = "https://github.com/lasa01/vtflib2-rs", rev = "0793c5a2322aaae7dc4b4527e53168284be94793", features = [
+vtflib2 = { git = "https://github.com/lasa01/vtflib2-rs", rev = "683e7fffe7fd011fb8ce08ed48e2e88573e0743e", features = [
     "static",
 ] }

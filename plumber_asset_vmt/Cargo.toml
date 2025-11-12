@@ -17,6 +17,6 @@ image = { version = "0.24.1", default-features = false }
 itertools = "0.10.0"
 zerocopy = { version = "0.6.1" }
 half = { version = "2.1.0", features = ["zerocopy"] }
-vtflib2 = { git = "https://github.com/lasa01/vtflib2-rs", rev = "0793c5a2322aaae7dc4b4527e53168284be94793", features = [
+vtflib2 = { git = "https://github.com/lasa01/vtflib2-rs", rev = "683e7fffe7fd011fb8ce08ed48e2e88573e0743e", features = [
     "static",
 ] }
