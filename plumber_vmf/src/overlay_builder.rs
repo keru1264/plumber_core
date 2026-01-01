@@ -438,7 +438,7 @@ impl<'a> Overlay<'a> {
         builder.ensure_not_empty()?;
 
         builder.create_uvs();
-        builder.recenter();
+        //builder.recenter();
         builder.finish(scale)
     }
 }
