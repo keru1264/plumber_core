@@ -66,7 +66,10 @@ impl OverlayFaceBuilder {
 struct OverlayBuilder<'a> {
     overlay: Overlay<'a>,
     uv_info: OverlayUvInfo,
-    origin: Vec3,
+    /// Origin used for UV space transformations (from BasisOrigin)
+    uv_origin: Vec3,
+    /// Origin computed from actual face geometry (for final positioning)
+    geometry_origin: Vec3,
     uv_to_global_matrix: Mat3,
     global_to_uv_matrix: Mat3,
     faces: Vec<OverlayFaceBuilder>,
@@ -75,28 +78,67 @@ struct OverlayBuilder<'a> {
 }
 
 impl<'a> OverlayBuilder<'a> {
-    fn new(overlay: Overlay<'a>) -> Result<Self, OverlayError> {
+    fn new(overlay: Overlay<'a>, side_faces_map: &SideFacesMap) -> Result<Self, OverlayError> {
         let uv_info = overlay.uv_info()?;
 
         let u_axis = uv_info.basis_u;
         let v_axis = uv_info.basis_v;
         let normal = uv_info.basis_normal;
-        let origin = uv_info.basis_origin;
+        let uv_origin = uv_info.basis_origin;
 
         let uv_to_global_matrix = Mat3::from_cols(u_axis, v_axis, normal);
-
         let global_to_uv_matrix = uv_to_global_matrix.inverse();
+
+        // Compute geometry origin from actual face vertices
+        // This handles the case where BSPSource fixes overlay faces but BasisOrigin is wrong
+        let geometry_origin = Self::compute_geometry_origin(&overlay, side_faces_map, &uv_info)?;
 
         Ok(Self {
             overlay,
             uv_info,
-            origin,
+            uv_origin,
+            geometry_origin,
             uv_to_global_matrix,
             global_to_uv_matrix,
             faces: Vec::new(),
             vertices: Vec::new(),
             uv_space_vertices: Vec::new(),
         })
+    }
+
+    /// Compute the origin from actual face geometry instead of relying on BasisOrigin.
+    /// This fixes positioning issues when BSPSource corrects overlay faces in enclosed spaces
+    /// but the entity helper (BasisOrigin) remains at the wrong position.
+    fn compute_geometry_origin(
+        overlay: &Overlay<'a>,
+        side_faces_map: &SideFacesMap,
+        uv_info: &OverlayUvInfo,
+    ) -> Result<Vec3, OverlayError> {
+        let mut all_vertices: Vec<Vec3> = Vec::new();
+
+        for side_i in overlay.sides()? {
+            if let Some(faces) = side_faces_map.get(&side_i) {
+                for vertices in faces {
+                    all_vertices.extend(vertices.iter().copied());
+                }
+            }
+        }
+
+        if all_vertices.is_empty() {
+            // Fallback to BasisOrigin if no geometry found
+            return Ok(uv_info.basis_origin);
+        }
+
+        // Compute center of all face vertices
+        let center = polygon_center(all_vertices.into_iter());
+
+        // Project center onto the overlay plane (defined by BasisNormal passing through BasisOrigin)
+        // to ensure the origin lies on the overlay plane
+        let to_center = center - uv_info.basis_origin;
+        let distance_along_normal = to_center.dot(uv_info.basis_normal);
+        let projected = center - uv_info.basis_normal * distance_along_normal;
+
+        Ok(projected)
     }
 
     fn create_vertices(
@@ -159,11 +201,12 @@ impl<'a> OverlayBuilder<'a> {
     fn cut_faces(&mut self, epsilon: f32, cut_threshold: f32) -> Result<(), OverlayError> {
         let vertices = &mut self.vertices;
         let global_to_uv_matrix = self.global_to_uv_matrix;
-        let origin = self.origin;
+        // Use uv_origin for UV space transformations (this is where BasisOrigin is still needed)
+        let uv_origin = self.uv_origin;
 
         let mut uv_space_vertices = vertices
             .iter()
-            .map(|&v| global_to_uv_matrix * (v - origin))
+            .map(|&v| global_to_uv_matrix * (v - uv_origin))
             .collect_vec();
 
         let up = Vec3::new(0.0, 0.0, 1.0);
@@ -211,7 +254,7 @@ impl<'a> OverlayBuilder<'a> {
                 let new_uv_space_vertice = cut_plane
                     .intersect_line(first_line_a, first_line_b - first_line_a, epsilon)
                     .ok_or(OverlayError::InvalidUvData)?;
-                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+                let new_vertice = self.uv_origin + self.uv_to_global_matrix * new_uv_space_vertice;
 
                 let first_new_i = vertices
                     .iter()
@@ -236,7 +279,7 @@ impl<'a> OverlayBuilder<'a> {
                 let new_uv_space_vertice = cut_plane
                     .intersect_line(last_line_a, last_line_b - last_line_a, epsilon)
                     .ok_or(OverlayError::InvalidUvData)?;
-                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+                let new_vertice = self.uv_origin + self.uv_to_global_matrix * new_uv_space_vertice;
 
                 let last_new_i = vertices
                     .iter()
@@ -391,12 +434,14 @@ impl<'a> OverlayBuilder<'a> {
     }
 
     fn recenter(&mut self) {
-        let center = polygon_center(self.vertices.iter().copied());
+        // Use geometry_origin (computed from actual faces) instead of recalculating
+        // This ensures overlays are positioned where the faces actually are,
+        // not where the potentially incorrect BasisOrigin says they should be
+        let center = self.geometry_origin;
         for vertice in &mut self.vertices {
             *vertice -= center;
         }
-        // vertices are global space before this point
-        self.origin = center;
+        self.geometry_origin = center;
     }
 
     fn finish(self, scale: f32) -> Result<BuiltOverlay<'a>, OverlayError> {
@@ -406,7 +451,8 @@ impl<'a> OverlayBuilder<'a> {
 
         Ok(BuiltOverlay {
             overlay: self.overlay,
-            position: self.origin * scale,
+            // Use geometry_origin for final positioning
+            position: self.geometry_origin * scale,
             scale,
             vertices: self.vertices,
             faces: self
@@ -429,7 +475,7 @@ impl<'a> Overlay<'a> {
         settings: &GeometrySettings,
         scale: f32,
     ) -> Result<BuiltOverlay<'a>, OverlayError> {
-        let mut builder = OverlayBuilder::new(self)?;
+        let mut builder = OverlayBuilder::new(self, side_faces_map)?;
         builder.create_vertices(side_faces_map, settings.epsilon)?;
         builder.offset_vertices()?;
         builder.cut_faces(settings.epsilon, settings.cut_threshold)?;
@@ -438,7 +484,7 @@ impl<'a> Overlay<'a> {
         builder.ensure_not_empty()?;
 
         builder.create_uvs();
-        //builder.recenter();
+        builder.recenter();
         builder.finish(scale)
     }
 }
