@@ -1,230 +1,444 @@
-use crate::{
-    builder_utils::{built_polygon_center, polygon_center, BuiltPolygon},
-    vmf_entity::Entity,
-};
-use glam::{Mat3, Vec2, Vec3};
-use itertools::Itertools;
+use std::{collections::BTreeMap, fmt::Debug};
 
-/// Builds overlay data from a VMF entity
-pub struct OverlayBuilder<'a> {
-    entity: &'a Entity,
-    basis_origin: Vec3,
-    basis_u: Vec3,
-    basis_v: Vec3,
-    basis_normal: Vec3,
-    start_u: f32,
-    end_u: f32,
-    start_v: f32,
-    end_v: f32,
-    uv_points: [Vec3; 4],
+use approx::relative_eq;
+use glam::{Mat3, Vec2, Vec3, Vec3Swizzles};
+use itertools::Itertools;
+use thiserror::Error;
+
+use plumber_fs::GamePathBuf;
+
+use super::{
+    builder_utils::{
+        affine_matrix, affine_transform_point, is_point_left_of_line, polygon_center,
+        polygon_normal, GeometrySettings, NdPlane,
+    },
+    entities::{EntityParseError, Overlay, OverlayUvInfo},
+};
+
+#[cfg(test)]
+mod tests;
+
+pub type SideFacesMap = BTreeMap<i32, Vec<Vec<Vec3>>>;
+
+#[derive(Debug, Error, Clone, Hash, PartialEq, Eq)]
+pub enum OverlayError {
+    #[error("error parsing overlay: {0}")]
+    Parse(#[from] EntityParseError),
+    #[error("overlay is applied to nonexistent side id {id}")]
+    SideNotFound { id: i32 },
+    #[error("no geometry was imported for the sides the overlay was applied to")]
+    NoGeometry,
+    #[error("overlay contains invalid uv data")]
+    InvalidUvData,
+}
+
+#[derive(Debug)]
+pub struct BuiltOverlay<'a> {
+    pub overlay: Overlay<'a>,
+    pub position: Vec3,
+    pub scale: f32,
+    pub vertices: Vec<Vec3>,
+    pub faces: Vec<BuiltOverlayFace>,
+    pub material: GamePathBuf,
+}
+
+#[derive(Debug)]
+pub struct BuiltOverlayFace {
+    pub vertice_indices: Vec<usize>,
+    pub vertice_uvs: Vec<Vec2>,
+}
+
+#[derive(Debug)]
+struct OverlayFaceBuilder {
+    vertice_indices: Vec<usize>,
+    vertice_uvs: Vec<Vec2>,
+}
+
+impl OverlayFaceBuilder {
+    fn finish(self) -> BuiltOverlayFace {
+        BuiltOverlayFace {
+            vertice_indices: self.vertice_indices,
+            vertice_uvs: self.vertice_uvs,
+        }
+    }
+}
+
+struct OverlayBuilder<'a> {
+    overlay: Overlay<'a>,
+    uv_info: OverlayUvInfo,
+    origin: Vec3,
+    uv_to_global_matrix: Mat3,
+    global_to_uv_matrix: Mat3,
+    faces: Vec<OverlayFaceBuilder>,
+    vertices: Vec<Vec3>,
+    uv_space_vertices: Vec<Vec3>,
 }
 
 impl<'a> OverlayBuilder<'a> {
-    pub fn new(entity: &'a Entity) -> Option<Self> {
-        let basis_origin = entity.property("BasisOrigin")?.parse().ok()?;
-        let basis_u = entity.property("BasisU")?.parse().ok()?;
-        let basis_v = entity.property("BasisV")?.parse().ok()?;
-        let basis_normal = entity.property("BasisNormal")?.parse().ok()?;
+    fn new(overlay: Overlay<'a>) -> Result<Self, OverlayError> {
+        let uv_info = overlay.uv_info()?;
 
-        let start_u: f32 = entity.property("StartU")?.parse().ok()?;
-        let end_u: f32 = entity.property("EndU")?.parse().ok()?;
-        let start_v: f32 = entity.property("StartV")?.parse().ok()?;
-        let end_v: f32 = entity.property("EndV")?.parse().ok()?;
+        let u_axis = uv_info.basis_u;
+        let v_axis = uv_info.basis_v;
+        let normal = uv_info.basis_normal;
+        let origin = uv_info.basis_origin;
 
-        let uv0 = entity.property("uv0")?.parse().ok()?;
-        let uv1 = entity.property("uv1")?.parse().ok()?;
-        let uv2 = entity.property("uv2")?.parse().ok()?;
-        let uv3 = entity.property("uv3")?.parse().ok()?;
+        let uv_to_global_matrix = Mat3::from_cols(u_axis, v_axis, normal);
 
-        Some(Self {
-            entity,
-            basis_origin,
-            basis_u,
-            basis_v,
-            basis_normal,
-            start_u,
-            end_u,
-            start_v,
-            end_v,
-            uv_points: [uv0, uv1, uv2, uv3],
+        let global_to_uv_matrix = uv_to_global_matrix.inverse();
+
+        Ok(Self {
+            overlay,
+            uv_info,
+            origin,
+            uv_to_global_matrix,
+            global_to_uv_matrix,
+            faces: Vec::new(),
+            vertices: Vec::new(),
+            uv_space_vertices: Vec::new(),
         })
     }
 
-    pub fn material(&self) -> Option<&str> {
-        self.entity.property("material")
-    }
+    fn create_vertices(
+        &mut self,
+        side_faces_map: &SideFacesMap,
+        epsilon: f32,
+    ) -> Result<(), OverlayError> {
+        for side_i in self.overlay.sides()? {
+            let faces = side_faces_map
+                .get(&side_i)
+                .ok_or(OverlayError::SideNotFound { id: side_i })?;
 
-    pub fn sides(&self) -> impl Iterator<Item = i32> + '_ {
-        self.entity
-            .property("sides")
-            .into_iter()
-            .flat_map(|s| s.split_whitespace())
-            .filter_map(|s| s.parse().ok())
-    }
-
-    /// Cuts the overlay polygon from the provided face polygons.
-    /// Returns vertices and UVs for the cut overlay geometry.
-    pub fn cut_faces(&self, faces: &[BuiltPolygon]) -> Option<(Vec<Vec3>, Vec<Vec2>)> {
-        if faces.is_empty() {
-            return None;
+            for vertices in faces {
+                let vertice_indices = vertices
+                    .iter()
+                    .map(|vertice| {
+                        // check if vertice already exists
+                        self.vertices
+                            .iter()
+                            .position(|v| relative_eq!(v, vertice, epsilon = epsilon))
+                            .unwrap_or_else(|| {
+                                // if not, create it
+                                self.vertices.push(*vertice);
+                                self.vertices.len() - 1
+                            })
+                    })
+                    .collect();
+                self.faces.push(OverlayFaceBuilder {
+                    vertice_indices,
+                    vertice_uvs: Vec::new(),
+                });
+            }
         }
 
-        // Build the transformation matrix from world space to UV space
-        let basis_matrix = Mat3::from_cols(self.basis_u, self.basis_v, self.basis_normal);
-        let inv_basis = basis_matrix.transpose();
+        if self.faces.is_empty() {
+            return Err(OverlayError::NoGeometry);
+        }
 
-        // Calculate the overlay polygon in UV space
-        let overlay_poly_uv: Vec<Vec2> = self
-            .uv_points
+        Ok(())
+    }
+
+    fn offset_vertices(&mut self) -> Result<(), OverlayError> {
+        let offset = f32::from(self.overlay.render_order()? + 1) * 0.1;
+        let mut offset_directions = vec![Vec3::ZERO; self.vertices.len()];
+
+        for builder in &self.faces {
+            let normal = polygon_normal(builder.vertice_indices.iter().map(|&i| self.vertices[i]));
+            for &vert_i in &builder.vertice_indices {
+                offset_directions[vert_i] += normal;
+            }
+        }
+
+        for (direction, vertice) in offset_directions.iter().zip(self.vertices.iter_mut()) {
+            *vertice += offset * direction.normalize();
+        }
+
+        Ok(())
+    }
+
+    fn cut_faces(&mut self, epsilon: f32, cut_threshold: f32) -> Result<(), OverlayError> {
+        let vertices = &mut self.vertices;
+        let global_to_uv_matrix = self.global_to_uv_matrix;
+        let origin = self.origin;
+
+        let mut uv_space_vertices = vertices
             .iter()
-            .map(|p| {
-                let local = inv_basis * (*p - self.basis_origin);
-                Vec2::new(local.x, local.y)
-            })
-            .collect();
+            .map(|&v| global_to_uv_matrix * (v - origin))
+            .collect_vec();
 
-        // Compute the actual center of all face geometry
-        let face_center = if faces.len() == 1 {
-            built_polygon_center(&faces[0])
-        } else {
-            // Average of all face centers
-            let sum: Vec3 = faces.iter().map(|f| built_polygon_center(f)).sum();
-            sum / faces.len() as f32
-        };
+        let up = Vec3::new(0.0, 0.0, 1.0);
 
-        // Compute offset between BasisOrigin and actual face geometry center.
-        // This fixes the issue where BSPSource moves BasisOrigin to displacement
-        // center but the overlay faces are elsewhere.
-        let origin_offset = face_center - self.basis_origin;
-        let origin_offset_uv = inv_basis * origin_offset;
-        let offset_2d = Vec2::new(origin_offset_uv.x, origin_offset_uv.y);
+        // cut faces partially outside uv borders
+        for (&side_vert_a, &side_vert_b) in self.uv_info.uvs.iter().circular_tuple_windows() {
+            let cut_plane_normal = up.cross(side_vert_b - side_vert_a).normalize();
+            let cut_plane = NdPlane::from_point_normal(side_vert_a, cut_plane_normal);
 
-        let mut all_vertices = Vec::new();
-        let mut all_uvs = Vec::new();
-
-        for face in faces {
-            // Transform face vertices to UV space, applying the offset correction
-            let uv_space_vertices: Vec<Vec2> = face
+            let outside_vertice_is = uv_space_vertices
                 .iter()
-                .map(|(pos, _)| {
-                    // Transform relative to BasisOrigin but account for the offset
-                    let local = inv_basis * (*pos - self.basis_origin);
-                    Vec2::new(local.x, local.y) - offset_2d
-                })
-                .collect();
+                .positions(|&v| cut_plane.distance_to_point(v) > cut_threshold)
+                .collect_vec();
 
-            // Clip the face polygon against the overlay polygon
-            let clipped = clip_polygon(&uv_space_vertices, &overlay_poly_uv);
+            for builder in &mut self.faces {
+                let inside_i = match builder
+                    .vertice_indices
+                    .iter()
+                    .position(|i| !outside_vertice_is.contains(i))
+                {
+                    Some(i) => i,
+                    // this face is completely outside the border, will be removed later
+                    None => continue,
+                };
 
-            if clipped.len() < 3 {
-                continue;
+                // rotate the vec so that it starts with a vertice that is inside
+                builder.vertice_indices.rotate_left(inside_i);
+
+                // find the first face vertice that is outside the uv border
+                let first_outside_i = match builder
+                    .vertice_indices
+                    .iter()
+                    .position(|i| outside_vertice_is.contains(i))
+                {
+                    Some(i) => i,
+                    // this face is completely inside the border, doesn't need to be cut
+                    None => continue,
+                };
+
+                let first_line_a = uv_space_vertices[builder.vertice_indices
+                    [(first_outside_i - 1) % builder.vertice_indices.len()]];
+                let first_line_b = uv_space_vertices[builder.vertice_indices[first_outside_i]];
+
+                // create new vertice on the uv border by intersecting the first edge crossing the uv border with the uv border plane
+                let new_uv_space_vertice = cut_plane
+                    .intersect_line(first_line_a, first_line_b - first_line_a, epsilon)
+                    .ok_or(OverlayError::InvalidUvData)?;
+                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+
+                let first_new_i = vertices
+                    .iter()
+                    .position(|v| relative_eq!(v, &new_vertice, epsilon = epsilon))
+                    .unwrap_or_else(|| {
+                        uv_space_vertices.push(new_uv_space_vertice);
+                        vertices.push(new_vertice);
+                        vertices.len() - 1
+                    });
+
+                // do the same for the last face vertice that is outside the border
+                let last_outside_i = builder
+                    .vertice_indices
+                    .iter()
+                    .rposition(|i| outside_vertice_is.contains(i))
+                    .expect("the case where there are no vertices outside is handled above");
+
+                let last_line_a = uv_space_vertices
+                    [builder.vertice_indices[(last_outside_i + 1) % builder.vertice_indices.len()]];
+                let last_line_b = uv_space_vertices[builder.vertice_indices[last_outside_i]];
+
+                let new_uv_space_vertice = cut_plane
+                    .intersect_line(last_line_a, last_line_b - last_line_a, epsilon)
+                    .ok_or(OverlayError::InvalidUvData)?;
+                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+
+                let last_new_i = vertices
+                    .iter()
+                    .position(|v| relative_eq!(v, &new_vertice, epsilon = epsilon))
+                    .unwrap_or_else(|| {
+                        uv_space_vertices.push(new_uv_space_vertice);
+                        vertices.push(new_vertice);
+                        vertices.len() - 1
+                    });
+
+                // replace the face vertices that were outside the uv border with the 2 newly created ones
+                builder
+                    .vertice_indices
+                    .splice(first_outside_i..=last_outside_i, [first_new_i, last_new_i]);
             }
+        }
 
-            // Transform back to world space and compute UVs
-            for uv_pos in &clipped {
-                // Add offset back when transforming to world space
-                let adjusted_uv = *uv_pos + offset_2d;
-                let world_pos = self.basis_origin
-                    + self.basis_u * adjusted_uv.x
-                    + self.basis_v * adjusted_uv.y;
-                all_vertices.push(world_pos);
+        self.uv_space_vertices = uv_space_vertices;
 
-                // Compute texture UVs based on position within overlay bounds
-                let u = remap(uv_pos.x, self.uv_points[0].x, self.uv_points[2].x, self.start_u, self.end_u);
-                let v = remap(uv_pos.y, self.uv_points[0].y, self.uv_points[2].y, self.start_v, self.end_v);
-                all_uvs.push(Vec2::new(u, v));
+        Ok(())
+    }
+
+    fn remove_vertices_outside(&mut self, cut_threshold: f32) {
+        let mut vertices_to_remove = Vec::new();
+
+        for (&side_vert_a, &side_vert_b) in self.uv_info.uvs.iter().circular_tuple_windows() {
+            let cut_plane_normal = Vec3::Z.cross(side_vert_b - side_vert_a).normalize();
+            let cut_plane = NdPlane::from_point_normal(side_vert_a, cut_plane_normal);
+            for (i, _) in self
+                .uv_space_vertices
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| cut_plane.distance_to_point(v) > cut_threshold)
+            {
+                if !vertices_to_remove.contains(&i) {
+                    vertices_to_remove.push(i);
+                }
             }
         }
 
-        if all_vertices.is_empty() {
-            None
-        } else {
-            Some((all_vertices, all_uvs))
-        }
-    }
-}
-
-/// Remaps a value from one range to another
-fn remap(value: f32, from_min: f32, from_max: f32, to_min: f32, to_max: f32) -> f32 {
-    let from_range = from_max - from_min;
-    if from_range.abs() < f32::EPSILON {
-        return to_min;
-    }
-    let t = (value - from_min) / from_range;
-    to_min + t * (to_max - to_min)
-}
-
-/// Clips a polygon against another polygon using Sutherland-Hodgman algorithm
-fn clip_polygon(subject: &[Vec2], clip: &[Vec2]) -> Vec<Vec2> {
-    if subject.is_empty() || clip.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut output = subject.to_vec();
-
-    for (i, &clip_v1) in clip.iter().enumerate() {
-        if output.is_empty() {
-            break;
-        }
-
-        let clip_v2 = clip[(i + 1) % clip.len()];
-        let edge = clip_v2 - clip_v1;
-        let edge_normal = Vec2::new(-edge.y, edge.x);
-
-        let input = output;
-        output = Vec::new();
-
-        for (j, &v1) in input.iter().enumerate() {
-            let v2 = input[(j + 1) % input.len()];
-
-            let d1 = (v1 - clip_v1).dot(edge_normal);
-            let d2 = (v2 - clip_v1).dot(edge_normal);
-
-            let v1_inside = d1 >= 0.0;
-            let v2_inside = d2 >= 0.0;
-
-            if v1_inside {
-                output.push(v1);
-                if !v2_inside {
-                    // Exiting: add intersection
-                    if let Some(intersection) = line_intersection(v1, v2, clip_v1, clip_v2) {
-                        output.push(intersection);
+        let mut i = 0_usize;
+        let mut new_i = 0_usize;
+        let faces = &mut self.faces;
+        self.vertices.retain(|_| {
+            if vertices_to_remove.contains(&i) {
+                // remove faces referencing the vertice
+                faces.retain(|f| !f.vertice_indices.contains(&i));
+                i += 1;
+                false
+            } else {
+                // fix other faces' vertice indices
+                for builder in faces.iter_mut() {
+                    for f_i in &mut builder.vertice_indices {
+                        if *f_i == i {
+                            *f_i = new_i;
+                        }
                     }
                 }
-            } else if v2_inside {
-                // Entering: add intersection
-                if let Some(intersection) = line_intersection(v1, v2, clip_v1, clip_v2) {
-                    output.push(intersection);
-                }
+                i += 1;
+                new_i += 1;
+                true
+            }
+        });
+
+        i = 0;
+        self.uv_space_vertices.retain(|_| {
+            let retain = !vertices_to_remove.contains(&i);
+            i += 1;
+            retain
+        });
+    }
+
+    fn cleanup_faces(&mut self) {
+        self.faces.retain_mut(|face| {
+            // Make sure there are no sequential duplicate vertice indices in a face (which would be an invalid face)
+
+            let Some(previous_vertice_index) = face.vertice_indices.last() else {
+                return false;
+            };
+            let mut previous_vertice_index = *previous_vertice_index;
+
+            face.vertice_indices.retain(|&i| {
+                let retain = i != previous_vertice_index;
+
+                previous_vertice_index = i;
+
+                retain
+            });
+
+            // And also remove the whole face if there are less than 3 vertices after the cleanup
+            face.vertice_indices.len() >= 3
+        });
+    }
+
+    fn ensure_not_empty(&self) -> Result<(), OverlayError> {
+        if self.faces.is_empty() {
+            return Err(OverlayError::InvalidUvData);
+        }
+        Ok(())
+    }
+
+    fn create_uvs(&mut self) {
+        for builder in &mut self.faces {
+            // uv calculations are 2 affine transformations of triangles
+
+            // calculate matrix for first triangle (uv points 0, 1, 2)
+            let affine_matrix_a = affine_matrix(
+                [
+                    self.uv_info.uvs[0].xy(),
+                    self.uv_info.uvs[1].xy(),
+                    self.uv_info.uvs[2].xy(),
+                ],
+                [
+                    Vec2::new(self.uv_info.start_u, self.uv_info.start_v),
+                    Vec2::new(self.uv_info.start_u, self.uv_info.end_v),
+                    Vec2::new(self.uv_info.end_u, self.uv_info.end_v),
+                ],
+            );
+
+            // same for second triangle (uv points 2, 3, 0)
+            let affine_matrix_b = affine_matrix(
+                [
+                    self.uv_info.uvs[2].xy(),
+                    self.uv_info.uvs[3].xy(),
+                    self.uv_info.uvs[0].xy(),
+                ],
+                [
+                    Vec2::new(self.uv_info.end_u, self.uv_info.end_v),
+                    Vec2::new(self.uv_info.end_u, self.uv_info.start_v),
+                    Vec2::new(self.uv_info.start_u, self.uv_info.start_v),
+                ],
+            );
+
+            for &vert_i in &builder.vertice_indices {
+                let uv_vert = self.uv_space_vertices[vert_i].xy();
+
+                // determine which triangle this vertice is inside of
+                let affine_matrix = if is_point_left_of_line(
+                    self.uv_info.uvs[0].xy(),
+                    self.uv_info.uvs[2].xy(),
+                    uv_vert,
+                ) {
+                    affine_matrix_a
+                } else {
+                    affine_matrix_b
+                };
+
+                let uv = affine_transform_point(affine_matrix, uv_vert);
+                builder.vertice_uvs.push(uv);
             }
         }
     }
 
-    output
-}
-
-/// Computes the intersection point of two line segments
-fn line_intersection(a1: Vec2, a2: Vec2, b1: Vec2, b2: Vec2) -> Option<Vec2> {
-    let d1 = a2 - a1;
-    let d2 = b2 - b1;
-
-    let cross = d1.x * d2.y - d1.y * d2.x;
-
-    if cross.abs() < f32::EPSILON {
-        return None;
+    fn recenter(&mut self) {
+        let center = polygon_center(self.vertices.iter().copied());
+        for vertice in &mut self.vertices {
+            *vertice -= center;
+        }
+        // vertices are global space before this point
+        self.origin = center;
     }
 
-    let d = b1 - a1;
-    let t = (d.x * d2.y - d.y * d2.x) / cross;
+    fn finish(self, scale: f32) -> Result<BuiltOverlay<'a>, OverlayError> {
+        let mut material = GamePathBuf::from("materials");
+        let overlay_material = self.overlay.material()?;
+        material.push(&overlay_material);
 
-    Some(a1 + d1 * t)
+        Ok(BuiltOverlay {
+            overlay: self.overlay,
+            position: self.origin * scale,
+            scale,
+            vertices: self.vertices,
+            faces: self
+                .faces
+                .into_iter()
+                .map(OverlayFaceBuilder::finish)
+                .collect(),
+            material,
+        })
+    }
 }
 
-/// Computes the center of a built polygon
-fn built_polygon_center(polygon: &BuiltPolygon) -> Vec3 {
-    if polygon.is_empty() {
-        return Vec3::ZERO;
+impl<'a> Overlay<'a> {
+    /// # Errors
+    ///
+    /// Returns `Err` if the mesh creation fails.
+    pub fn build_mesh(
+        self,
+        side_faces_map: &SideFacesMap,
+        settings: &GeometrySettings,
+        scale: f32,
+    ) -> Result<BuiltOverlay<'a>, OverlayError> {
+        let mut builder = OverlayBuilder::new(self)?;
+        builder.create_vertices(side_faces_map, settings.epsilon)?;
+        builder.offset_vertices()?;
+        builder.cut_faces(settings.epsilon, settings.cut_threshold)?;
+        builder.remove_vertices_outside(settings.cut_threshold);
+        builder.cleanup_faces();
+        builder.ensure_not_empty()?;
+
+        builder.create_uvs();
+        builder.recenter();
+        builder.finish(scale)
     }
-    let sum: Vec3 = polygon.iter().map(|(pos, _)| *pos).sum();
-    sum / polygon.len() as f32
 }
