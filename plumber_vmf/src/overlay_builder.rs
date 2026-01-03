@@ -1,356 +1,444 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Debug};
 
-use glam::{Vec2, Vec3};
+use approx::relative_eq;
+use glam::{Mat3, Vec2, Vec3, Vec3Swizzles};
 use itertools::Itertools;
-use plumber_vmt::MaterialInfo;
+use thiserror::Error;
 
-use crate::{
+use plumber_fs::GamePathBuf;
+
+use super::{
     builder_utils::{
-        building_polygons_to_face_mesh, polygon_center, GeometrySettings, PolygonWithNormals,
+        affine_matrix, affine_transform_point, is_point_left_of_line, polygon_center,
+        polygon_normal, GeometrySettings, NdPlane,
     },
-    vmf_entity::{Entity, Overlay, Side, Solid},
+    entities::{EntityParseError, Overlay, OverlayUvInfo},
 };
 
-#[derive(Debug, Clone)]
-pub struct BuiltOverlay {
-    pub id: i32,
-    pub material_name: String,
+#[cfg(test)]
+mod tests;
+
+pub type SideFacesMap = BTreeMap<i32, Vec<Vec<Vec3>>>;
+
+#[derive(Debug, Error, Clone, Hash, PartialEq, Eq)]
+pub enum OverlayError {
+    #[error("error parsing overlay: {0}")]
+    Parse(#[from] EntityParseError),
+    #[error("overlay is applied to nonexistent side id {id}")]
+    SideNotFound { id: i32 },
+    #[error("no geometry was imported for the sides the overlay was applied to")]
+    NoGeometry,
+    #[error("overlay contains invalid uv data")]
+    InvalidUvData,
+}
+
+#[derive(Debug)]
+pub struct BuiltOverlay<'a> {
+    pub overlay: Overlay<'a>,
     pub position: Vec3,
-    pub u: Vec3,
-    pub v: Vec3,
-    pub mesh: OverlayMesh,
+    pub scale: f32,
+    pub vertices: Vec<Vec3>,
+    pub faces: Vec<BuiltOverlayFace>,
+    pub material: GamePathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct OverlayMesh {
-    pub positions: Vec<Vec3>,
-    pub normals: Vec<Vec3>,
-    pub uvs: Vec<Vec2>,
-    pub alpha: Vec<f32>,
+#[derive(Debug)]
+pub struct BuiltOverlayFace {
+    pub vertice_indices: Vec<usize>,
+    pub vertice_uvs: Vec<Vec2>,
 }
 
-impl OverlayMesh {
-    #[must_use]
-    pub fn indices(&self) -> Vec<u32> {
-        (0..self.positions.len().saturating_sub(2))
-            .flat_map(|i| [0, i as u32 + 1, i as u32 + 2])
-            .collect()
-    }
+#[derive(Debug)]
+struct OverlayFaceBuilder {
+    vertice_indices: Vec<usize>,
+    vertice_uvs: Vec<Vec2>,
+}
 
-    fn recenter(&mut self) -> Vec3 {
-        let center = polygon_center(&self.positions);
-        for pos in &mut self.positions {
-            *pos -= center;
+impl OverlayFaceBuilder {
+    fn finish(self) -> BuiltOverlayFace {
+        BuiltOverlayFace {
+            vertice_indices: self.vertice_indices,
+            vertice_uvs: self.vertice_uvs,
         }
-        center
     }
 }
 
-pub struct OverlayBuilder<'a> {
-    overlay: &'a Overlay,
-    settings: &'a GeometrySettings,
+struct OverlayBuilder<'a> {
+    overlay: Overlay<'a>,
+    uv_info: OverlayUvInfo,
     origin: Vec3,
-    u_axis: Vec3,
-    v_axis: Vec3,
-    uv_data: UvData,
-    // side_faces: Option<SideFaces<'a>>,
-    sides_meshes: BTreeMap<i32, PolygonWithNormals>,
-    render_order: i32,
-}
-
-#[derive(Debug, Clone)]
-struct UvData {
-    pub start_u: f32,
-    pub end_u: f32,
-    pub start_v: f32,
-    pub end_v: f32,
+    uv_to_global_matrix: Mat3,
+    global_to_uv_matrix: Mat3,
+    faces: Vec<OverlayFaceBuilder>,
+    vertices: Vec<Vec3>,
+    uv_space_vertices: Vec<Vec3>,
 }
 
 impl<'a> OverlayBuilder<'a> {
-    #[must_use]
-    pub fn new(
-        overlay: &'a Overlay,
-        settings: &'a GeometrySettings,
-        sides_meshes: BTreeMap<i32, PolygonWithNormals>,
-    ) -> Self {
-        Self {
+    fn new(overlay: Overlay<'a>) -> Result<Self, OverlayError> {
+        let uv_info = overlay.uv_info()?;
+
+        let u_axis = uv_info.basis_u;
+        let v_axis = uv_info.basis_v;
+        let normal = uv_info.basis_normal;
+        let origin = uv_info.basis_origin;
+
+        let uv_to_global_matrix = Mat3::from_cols(u_axis, v_axis, normal);
+
+        let global_to_uv_matrix = uv_to_global_matrix.inverse();
+
+        Ok(Self {
             overlay,
-            settings,
-            origin: overlay.origin,
-            u_axis: overlay.basis_u,
-            v_axis: overlay.basis_v,
-            uv_data: UvData {
-                start_u: overlay.start_u,
-                end_u: overlay.end_u,
-                start_v: overlay.start_v,
-                end_v: overlay.end_v,
-            },
-            sides_meshes,
-            render_order: overlay.render_order.unwrap_or(0),
-        }
+            uv_info,
+            origin,
+            uv_to_global_matrix,
+            global_to_uv_matrix,
+            faces: Vec::new(),
+            vertices: Vec::new(),
+            uv_space_vertices: Vec::new(),
+        })
     }
 
-    /// Projects the overlay uv points to world coordinates.
-    fn project_uv_to_world(&self, uv: Vec2) -> Vec3 {
-        self.origin + self.u_axis * uv.x + self.v_axis * uv.y
-    }
+    fn create_vertices(
+        &mut self,
+        side_faces_map: &SideFacesMap,
+        epsilon: f32,
+    ) -> Result<(), OverlayError> {
+        for side_i in self.overlay.sides()? {
+            let faces = side_faces_map
+                .get(&side_i)
+                .ok_or(OverlayError::SideNotFound { id: side_i })?;
 
-    /// Projects a world position to the overlay plane uv coordinates.
-    fn project_world_to_uv(&self, pos: Vec3) -> Vec2 {
-        let offset = pos - self.origin;
-        let u = offset.dot(self.u_axis.normalize()) / self.u_axis.length();
-        let v = offset.dot(self.v_axis.normalize()) / self.v_axis.length();
-        Vec2::new(u, v)
-    }
-
-    /// Projects a world position to the overlay plane.
-    fn project_onto_overlay_plane(&self, pos: Vec3) -> Vec3 {
-        let uv = self.project_world_to_uv(pos);
-        self.project_uv_to_world(uv)
-    }
-
-    /// Returns the normals of the overlay pointing perpendicular to u and v axis.
-    fn overlay_plane_normals(&self) -> [Vec3; 2] {
-        let n1 = self.u_axis.cross(self.v_axis).normalize();
-        let n2 = -n1;
-        [n1, n2]
-    }
-
-    fn compute_mesh_uv(&self, pos: Vec3) -> Vec2 {
-        let uv = self.project_world_to_uv(pos);
-        // remap uv from (uv_data.start_u, uv_data.end_u) to (0, 1)
-        let u = (uv.x - self.uv_data.start_u) / (self.uv_data.end_u - self.uv_data.start_u);
-        // flip v
-        let v = 1.0 - (uv.y - self.uv_data.start_v) / (self.uv_data.end_v - self.uv_data.start_v);
-        Vec2::new(u, v)
-    }
-
-    fn uv_polygon(&self) -> [Vec2; 4] {
-        let uv_points = &self.overlay.uv_points;
-        // the 4 inner arrays are the 4 corners of the overlay
-        // the first point of each array is the corner
-        // we want to get the first point of each array
-        [uv_points[0][0], uv_points[1][0], uv_points[2][0], uv_points[3][0]]
-    }
-
-    #[must_use]
-    pub fn build_mesh(self, _material: Option<&MaterialInfo>) -> Option<BuiltOverlay> {
-        // get the 4 points of the overlay in world coordinates
-        let uv_polygon = self.uv_polygon();
-        let world_polygon = uv_polygon.map(|uv| self.project_uv_to_world(uv));
-
-        let mut builder = OverlayMesh::default();
-        let normals = self.overlay_plane_normals();
-
-        for (side_id, side_mesh) in &self.sides_meshes {
-            let side_center = polygon_center(&side_mesh.vertices);
-            let side_center_proj = self.project_onto_overlay_plane(side_center);
-
-            // test if the side center is inside the overlay
-            // let inside = point_in_polygon(side_center_proj, &world_polygon);
-            let closest = crate::builder_utils::closest_edge_point(&side_center_proj, &world_polygon);
-            let inside = (side_center_proj - closest).length_squared() < 1e-6 
-                || is_inside_convex_polygon(&side_center_proj, &world_polygon);
-
-            // pick the normal that points to the same general direction as the face normals
-            let face_normal = side_mesh.normals[0];
-            let normal_facing_face = normals.iter().max_by(|a, b| {
-                a.dot(face_normal).partial_cmp(&b.dot(face_normal)).unwrap()
-            }).copied().unwrap_or(normals[0]);
-
-            if inside {
-                // clip side polygon to overlay polygon
-                let mut clipped = side_mesh.vertices.clone();
-                let mut clipped_normals = side_mesh.normals.clone();
-                clip_polygon_with_normals(&mut clipped, &mut clipped_normals, &world_polygon);
-                if clipped.len() < 3 {
-                    continue;
-                }
-
-                // offset clipped vertices slightly along the normal
-                let offset = normal_facing_face * (0.1 + self.render_order as f32 * 0.01);
-                for vertex in &mut clipped {
-                    *vertex += offset;
-                }
-
-                // add the polygon to the mesh
-                let start_idx = builder.positions.len();
-                builder.positions.extend(clipped.iter().copied());
-                builder.normals.extend(clipped_normals);
-                builder.uvs.extend(clipped.iter().map(|pos| self.compute_mesh_uv(*pos)));
-                builder.alpha.extend(std::iter::repeat(1.0).take(clipped.len()));
+            for vertices in faces {
+                let vertice_indices = vertices
+                    .iter()
+                    .map(|vertice| {
+                        // check if vertice already exists
+                        self.vertices
+                            .iter()
+                            .position(|v| relative_eq!(v, vertice, epsilon = epsilon))
+                            .unwrap_or_else(|| {
+                                // if not, create it
+                                self.vertices.push(*vertice);
+                                self.vertices.len() - 1
+                            })
+                    })
+                    .collect();
+                self.faces.push(OverlayFaceBuilder {
+                    vertice_indices,
+                    vertice_uvs: Vec::new(),
+                });
             }
         }
 
-        if builder.positions.is_empty() {
-            return None;
+        if self.faces.is_empty() {
+            return Err(OverlayError::NoGeometry);
         }
 
-        // builder.recenter();
-        //builder.recenter();
+        Ok(())
+    }
 
-        Some(BuiltOverlay {
-            id: self.overlay.id,
-            material_name: self.overlay.material.clone(),
-            position: Vec3::ZERO,
-            u: self.u_axis,
-            v: self.v_axis,
-            mesh: builder,
+    fn offset_vertices(&mut self) -> Result<(), OverlayError> {
+        let offset = f32::from(self.overlay.render_order()? + 1) * 0.1;
+        let mut offset_directions = vec![Vec3::ZERO; self.vertices.len()];
+
+        for builder in &self.faces {
+            let normal = polygon_normal(builder.vertice_indices.iter().map(|&i| self.vertices[i]));
+            for &vert_i in &builder.vertice_indices {
+                offset_directions[vert_i] += normal;
+            }
+        }
+
+        for (direction, vertice) in offset_directions.iter().zip(self.vertices.iter_mut()) {
+            *vertice += offset * direction.normalize();
+        }
+
+        Ok(())
+    }
+
+    fn cut_faces(&mut self, epsilon: f32, cut_threshold: f32) -> Result<(), OverlayError> {
+        let vertices = &mut self.vertices;
+        let global_to_uv_matrix = self.global_to_uv_matrix;
+        let origin = self.origin;
+
+        let mut uv_space_vertices = vertices
+            .iter()
+            .map(|&v| global_to_uv_matrix * (v - origin))
+            .collect_vec();
+
+        let up = Vec3::new(0.0, 0.0, 1.0);
+
+        // cut faces partially outside uv borders
+        for (&side_vert_a, &side_vert_b) in self.uv_info.uvs.iter().circular_tuple_windows() {
+            let cut_plane_normal = up.cross(side_vert_b - side_vert_a).normalize();
+            let cut_plane = NdPlane::from_point_normal(side_vert_a, cut_plane_normal);
+
+            let outside_vertice_is = uv_space_vertices
+                .iter()
+                .positions(|&v| cut_plane.distance_to_point(v) > cut_threshold)
+                .collect_vec();
+
+            for builder in &mut self.faces {
+                let inside_i = match builder
+                    .vertice_indices
+                    .iter()
+                    .position(|i| !outside_vertice_is.contains(i))
+                {
+                    Some(i) => i,
+                    // this face is completely outside the border, will be removed later
+                    None => continue,
+                };
+
+                // rotate the vec so that it starts with a vertice that is inside
+                builder.vertice_indices.rotate_left(inside_i);
+
+                // find the first face vertice that is outside the uv border
+                let first_outside_i = match builder
+                    .vertice_indices
+                    .iter()
+                    .position(|i| outside_vertice_is.contains(i))
+                {
+                    Some(i) => i,
+                    // this face is completely inside the border, doesn't need to be cut
+                    None => continue,
+                };
+
+                let first_line_a = uv_space_vertices[builder.vertice_indices
+                    [(first_outside_i - 1) % builder.vertice_indices.len()]];
+                let first_line_b = uv_space_vertices[builder.vertice_indices[first_outside_i]];
+
+                // create new vertice on the uv border by intersecting the first edge crossing the uv border with the uv border plane
+                let new_uv_space_vertice = cut_plane
+                    .intersect_line(first_line_a, first_line_b - first_line_a, epsilon)
+                    .ok_or(OverlayError::InvalidUvData)?;
+                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+
+                let first_new_i = vertices
+                    .iter()
+                    .position(|v| relative_eq!(v, &new_vertice, epsilon = epsilon))
+                    .unwrap_or_else(|| {
+                        uv_space_vertices.push(new_uv_space_vertice);
+                        vertices.push(new_vertice);
+                        vertices.len() - 1
+                    });
+
+                // do the same for the last face vertice that is outside the border
+                let last_outside_i = builder
+                    .vertice_indices
+                    .iter()
+                    .rposition(|i| outside_vertice_is.contains(i))
+                    .expect("the case where there are no vertices outside is handled above");
+
+                let last_line_a = uv_space_vertices
+                    [builder.vertice_indices[(last_outside_i + 1) % builder.vertice_indices.len()]];
+                let last_line_b = uv_space_vertices[builder.vertice_indices[last_outside_i]];
+
+                let new_uv_space_vertice = cut_plane
+                    .intersect_line(last_line_a, last_line_b - last_line_a, epsilon)
+                    .ok_or(OverlayError::InvalidUvData)?;
+                let new_vertice = self.origin + self.uv_to_global_matrix * new_uv_space_vertice;
+
+                let last_new_i = vertices
+                    .iter()
+                    .position(|v| relative_eq!(v, &new_vertice, epsilon = epsilon))
+                    .unwrap_or_else(|| {
+                        uv_space_vertices.push(new_uv_space_vertice);
+                        vertices.push(new_vertice);
+                        vertices.len() - 1
+                    });
+
+                // replace the face vertices that were outside the uv border with the 2 newly created ones
+                builder
+                    .vertice_indices
+                    .splice(first_outside_i..=last_outside_i, [first_new_i, last_new_i]);
+            }
+        }
+
+        self.uv_space_vertices = uv_space_vertices;
+
+        Ok(())
+    }
+
+    fn remove_vertices_outside(&mut self, cut_threshold: f32) {
+        let mut vertices_to_remove = Vec::new();
+
+        for (&side_vert_a, &side_vert_b) in self.uv_info.uvs.iter().circular_tuple_windows() {
+            let cut_plane_normal = Vec3::Z.cross(side_vert_b - side_vert_a).normalize();
+            let cut_plane = NdPlane::from_point_normal(side_vert_a, cut_plane_normal);
+            for (i, _) in self
+                .uv_space_vertices
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| cut_plane.distance_to_point(v) > cut_threshold)
+            {
+                if !vertices_to_remove.contains(&i) {
+                    vertices_to_remove.push(i);
+                }
+            }
+        }
+
+        let mut i = 0_usize;
+        let mut new_i = 0_usize;
+        let faces = &mut self.faces;
+        self.vertices.retain(|_| {
+            if vertices_to_remove.contains(&i) {
+                // remove faces referencing the vertice
+                faces.retain(|f| !f.vertice_indices.contains(&i));
+                i += 1;
+                false
+            } else {
+                // fix other faces' vertice indices
+                for builder in faces.iter_mut() {
+                    for f_i in &mut builder.vertice_indices {
+                        if *f_i == i {
+                            *f_i = new_i;
+                        }
+                    }
+                }
+                i += 1;
+                new_i += 1;
+                true
+            }
+        });
+
+        i = 0;
+        self.uv_space_vertices.retain(|_| {
+            let retain = !vertices_to_remove.contains(&i);
+            i += 1;
+            retain
+        });
+    }
+
+    fn cleanup_faces(&mut self) {
+        self.faces.retain_mut(|face| {
+            // Make sure there are no sequential duplicate vertice indices in a face (which would be an invalid face)
+
+            let Some(previous_vertice_index) = face.vertice_indices.last() else {
+                return false;
+            };
+            let mut previous_vertice_index = *previous_vertice_index;
+
+            face.vertice_indices.retain(|&i| {
+                let retain = i != previous_vertice_index;
+
+                previous_vertice_index = i;
+
+                retain
+            });
+
+            // And also remove the whole face if there are less than 3 vertices after the cleanup
+            face.vertice_indices.len() >= 3
+        });
+    }
+
+    fn ensure_not_empty(&self) -> Result<(), OverlayError> {
+        if self.faces.is_empty() {
+            return Err(OverlayError::InvalidUvData);
+        }
+        Ok(())
+    }
+
+    fn create_uvs(&mut self) {
+        for builder in &mut self.faces {
+            // uv calculations are 2 affine transformations of triangles
+
+            // calculate matrix for first triangle (uv points 0, 1, 2)
+            let affine_matrix_a = affine_matrix(
+                [
+                    self.uv_info.uvs[0].xy(),
+                    self.uv_info.uvs[1].xy(),
+                    self.uv_info.uvs[2].xy(),
+                ],
+                [
+                    Vec2::new(self.uv_info.start_u, self.uv_info.start_v),
+                    Vec2::new(self.uv_info.start_u, self.uv_info.end_v),
+                    Vec2::new(self.uv_info.end_u, self.uv_info.end_v),
+                ],
+            );
+
+            // same for second triangle (uv points 2, 3, 0)
+            let affine_matrix_b = affine_matrix(
+                [
+                    self.uv_info.uvs[2].xy(),
+                    self.uv_info.uvs[3].xy(),
+                    self.uv_info.uvs[0].xy(),
+                ],
+                [
+                    Vec2::new(self.uv_info.end_u, self.uv_info.end_v),
+                    Vec2::new(self.uv_info.end_u, self.uv_info.start_v),
+                    Vec2::new(self.uv_info.start_u, self.uv_info.start_v),
+                ],
+            );
+
+            for &vert_i in &builder.vertice_indices {
+                let uv_vert = self.uv_space_vertices[vert_i].xy();
+
+                // determine which triangle this vertice is inside of
+                let affine_matrix = if is_point_left_of_line(
+                    self.uv_info.uvs[0].xy(),
+                    self.uv_info.uvs[2].xy(),
+                    uv_vert,
+                ) {
+                    affine_matrix_a
+                } else {
+                    affine_matrix_b
+                };
+
+                let uv = affine_transform_point(affine_matrix, uv_vert);
+                builder.vertice_uvs.push(uv);
+            }
+        }
+    }
+
+    fn recenter(&mut self) {
+        let center = polygon_center(self.vertices.iter().copied());
+        for vertice in &mut self.vertices {
+            *vertice -= center;
+        }
+        // vertices are global space before this point
+        self.origin = center;
+    }
+
+    fn finish(self, scale: f32) -> Result<BuiltOverlay<'a>, OverlayError> {
+        let mut material = GamePathBuf::from("materials");
+        let overlay_material = self.overlay.material()?;
+        material.push(&overlay_material);
+
+        Ok(BuiltOverlay {
+            overlay: self.overlay,
+            position: self.origin * scale,
+            scale,
+            vertices: self.vertices,
+            faces: self
+                .faces
+                .into_iter()
+                .map(OverlayFaceBuilder::finish)
+                .collect(),
+            material,
         })
     }
 }
 
-/// Tests if a point is inside a convex polygon.
-fn is_inside_convex_polygon(point: &Vec3, polygon: &[Vec3]) -> bool {
-    let n = polygon.len();
-    if n < 3 {
-        return false;
-    }
+impl<'a> Overlay<'a> {
+    /// # Errors
+    ///
+    /// Returns `Err` if the mesh creation fails.
+    pub fn build_mesh(
+        self,
+        side_faces_map: &SideFacesMap,
+        settings: &GeometrySettings,
+        scale: f32,
+    ) -> Result<BuiltOverlay<'a>, OverlayError> {
+        let mut builder = OverlayBuilder::new(self)?;
+        builder.create_vertices(side_faces_map, settings.epsilon)?;
+        builder.offset_vertices()?;
+        builder.cut_faces(settings.epsilon, settings.cut_threshold)?;
+        builder.remove_vertices_outside(settings.cut_threshold);
+        builder.cleanup_faces();
+        builder.ensure_not_empty()?;
 
-    let mut sign = None;
-    for i in 0..n {
-        let v0 = polygon[i];
-        let v1 = polygon[(i + 1) % n];
-        let edge = v1 - v0;
-        let to_point = *point - v0;
-        let cross = edge.cross(to_point);
-        let dot = cross.dot(cross);
-        if dot.abs() < 1e-10 {
-            continue;
-        }
-        let current_sign = dot > 0.0;
-        match sign {
-            None => sign = Some(current_sign),
-            Some(s) if s != current_sign => return false,
-            _ => {}
-        }
-    }
-    true
-}
-
-/// Clips a polygon with vertex normals against another convex polygon.
-fn clip_polygon_with_normals(
-    vertices: &mut Vec<Vec3>,
-    normals: &mut Vec<Vec3>,
-    clip_polygon: &[Vec3],
-) {
-    let n = clip_polygon.len();
-    for i in 0..n {
-        let edge_start = clip_polygon[i];
-        let edge_end = clip_polygon[(i + 1) % n];
-        let edge_dir = edge_end - edge_start;
-
-        // compute the inward normal of the clipping edge
-        // assuming the polygon is wound counter-clockwise
-        let center = polygon_center(clip_polygon);
-        let to_center = center - edge_start;
-        let edge_normal_candidate = edge_dir.cross(to_center.cross(edge_dir)).normalize();
-        let edge_normal = if edge_normal_candidate.dot(to_center) > 0.0 {
-            edge_normal_candidate
-        } else {
-            -edge_normal_candidate
-        };
-
-        // clip the polygon against the edge
-        let mut new_vertices = Vec::with_capacity(vertices.len());
-        let mut new_normals = Vec::with_capacity(normals.len());
-        for j in 0..vertices.len() {
-            let v0 = vertices[j];
-            let v1 = vertices[(j + 1) % vertices.len()];
-            let n0 = normals[j];
-            let n1 = normals[(j + 1) % normals.len()];
-            let d0 = (v0 - edge_start).dot(edge_normal);
-            let d1 = (v1 - edge_start).dot(edge_normal);
-
-            if d0 >= 0.0 {
-                // v0 is inside
-                new_vertices.push(v0);
-                new_normals.push(n0);
-                if d1 < 0.0 {
-                    // v1 is outside, compute intersection
-                    let t = d0 / (d0 - d1);
-                    let intersection = v0 + t * (v1 - v0);
-                    let normal = n0.lerp(n1, t).normalize();
-                    new_vertices.push(intersection);
-                    new_normals.push(normal);
-                }
-            } else if d1 >= 0.0 {
-                // v0 is outside, v1 is inside
-                let t = d0 / (d0 - d1);
-                let intersection = v0 + t * (v1 - v0);
-                let normal = n0.lerp(n1, t).normalize();
-                new_vertices.push(intersection);
-                new_normals.push(normal);
-            }
-        }
-        *vertices = new_vertices;
-        *normals = new_normals;
-
-        if vertices.len() < 3 {
-            return;
-        }
-    }
-}
-
-pub fn entity_has_overlays(entity: &Entity) -> bool {
-    entity
-        .properties
-        .iter()
-        .any(|(key, _)| key.starts_with("sides"))
-}
-
-pub fn entity_get_overlay_sides<'a>(
-    overlay_entity: &'a Entity,
-) -> impl Iterator<Item = i32> + 'a {
-    overlay_entity
-        .properties
-        .iter()
-        .filter(|(key, _)| key.starts_with("sides"))
-        .flat_map(|(_, value)| value.split_whitespace())
-        .filter_map(|s| s.parse::<i32>().ok())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_inside_convex_polygon() {
-        let polygon = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(1.0, 1.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-        ];
-
-        assert!(is_inside_convex_polygon(&Vec3::new(0.5, 0.5, 0.0), &polygon));
-        assert!(!is_inside_convex_polygon(&Vec3::new(2.0, 0.5, 0.0), &polygon));
-    }
-
-    #[test]
-    fn test_clip_polygon_with_normals() {
-        let mut vertices = vec![
-            Vec3::new(-1.0, -1.0, 0.0),
-            Vec3::new(2.0, -1.0, 0.0),
-            Vec3::new(2.0, 2.0, 0.0),
-            Vec3::new(-1.0, 2.0, 0.0),
-        ];
-        let mut normals = vec![
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(0.0, 0.0, 1.0),
-        ];
-        let clip_polygon = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(1.0, 1.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-        ];
-
-        clip_polygon_with_normals(&mut vertices, &mut normals, &clip_polygon);
-
-        assert_eq!(vertices.len(), 4);
-        assert!(vertices.iter().all(|v| v.x >= 0.0 && v.x <= 1.0 && v.y >= 0.0 && v.y <= 1.0));
+        builder.create_uvs();
+        builder.recenter();
+        builder.finish(scale)
     }
 }
